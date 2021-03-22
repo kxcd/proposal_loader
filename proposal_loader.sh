@@ -1,7 +1,7 @@
 #!/bin/bash
 #set -x
 
-VERSION="$0 (v0.2.0 build date 202011150039)"
+VERSION="$0 (v0.2.3 build date 202103221400)"
 DATABASE_VERSION=1
 DATADIR="$HOME/.dash_proposal_loader"
 
@@ -45,7 +45,7 @@ echo "[$$] Starting $VERSION." >&2
 
 
 
-# Now we are safe to use variables like NETWORK and DATADIR, so let's compute a database_file
+# Now we are safe to use variables eg DATADIR, so let's compute a database_file
 DATABASE_FILE="$DATADIR/database/proposals.db"
 
 
@@ -66,9 +66,6 @@ check_dependencies(){
 
 make_datadir(){
 
-	# If a custom datadir is passed in, use it.
-	[[ -n $1 ]] && DATADIR="$1"
-
 	if [[ ! -d "$DATADIR" ]];then
 		mkdir -p "$DATADIR"/{database,logs}
 		if (( $? != 0 ));then
@@ -87,9 +84,10 @@ execute_sql(){
 		sqlite3 "$DATABASE_FILE" <<< "$1" 2>>"$DATADIR"/logs/sqlite.log && return
 		retval=$?
 		echo "[$$] Failed query attempt number: $i." >>"$DATADIR"/logs/sqlite.log
-		sleep 1
-		# sleep a two digit random time after every 10 failed shots.
-		(($(($i % 10)) == 0))&& sleep ${RANDOM:0:2}
+		delay=1
+		# Add extra delay time after every 10 failed shots.
+		(($((i % 10)) == 0)) && delay=$((delay+RANDOM%100))
+		sleep "$delay"
 	done
 	echo -e "[$$] The failed query vvvvv\n$1\n[$$] ^^^^^ The above query did not succeed after $i attempts, aborting..." >>"$DATADIR"/logs/sqlite.log
 	return $retval
@@ -106,9 +104,10 @@ initialise_database(){
 	sql="PRAGMA foreign_keys = ON;"
 	sql+="create table db_version(version integer primary key not null);"
 	sql+="insert into db_version values(1);"
-	sql+="create table proposals(run_date integer not null, ProposalHash text primary key not null, CollateralHash text not null, ObjectType integer not null, CreationTime integer not null, fBlockchainValidity text not null, IsValidReason text, fCachedValid text not null, fCachedFunding text not null, fCachedDelete text not null, fCachedEndorsed text not null, end_epoch integer not null, name text nor null, payment_address text not null, payment_amount real not null check(payment_amount>=0), start_epoch integer not null, Type integer not null, url text);"
+	sql+="create table proposals(run_date integer not null check(run_date>=0), ProposalHash text primary key not null, CollateralHash text not null, ObjectType integer not null, CreationTime integer not null, fBlockchainValidity text not null, IsValidReason text, fCachedValid text not null, fCachedFunding text not null, fCachedDelete text not null, fCachedEndorsed text not null, end_epoch integer not null, name text nor null, payment_address text not null, payment_amount real not null check(payment_amount>=0), start_epoch integer not null, Type integer not null, url text);"
 	sql+="create unique index idx_ProposalHash on proposals(ProposalHash);"
-	sql+="create table votes(run_date integer not null, ProposalHash text not null,  AbsoluteYesCount integer not null, YesCount integer not null, NoCount integer not null, AbstainCount integer not null,foreign key(run_date,ProposalHash)references proposals(run_date,ProposalHash), primary key(run_date,ProposalHash));"
+	sql+="create table votes(run_date integer not null check(run_date>=0),height integer not null check(height>=0), ProposalHash text not null,  AbsoluteYesCount integer not null, YesCount integer not null, NoCount integer not null, AbstainCount integer not null,foreign key(ProposalHash)references proposals(ProposalHash), primary key(run_date,ProposalHash));"
+	sql+="create index idx_vote_ProposalHash on votes(ProposalHash);"
 	sql+="create trigger delete_proposal before delete on proposals for each row begin delete from votes where ProposalHash=old.ProposalHash;delete from votes where ProposalHash=old.ProposalHash;end;"
 	execute_sql "$sql"
 	if (( $? != 0 ));then
@@ -124,7 +123,7 @@ initialise_database(){
 check_and_upgrade_database(){
 
 	db_version=$(execute_sql "select version from db_version;")
-	if (( $db_version != $DATABASE_VERSION ));then
+	if (( db_version != DATABASE_VERSION ));then
 		echo "[$$] The database version is $db_version was expecting $DATABASE_VERSION" >&2
 		exit 5;
 	fi
@@ -138,6 +137,7 @@ check_and_upgrade_database(){
 parseAndLoadProposals(){
 
 	run_date=$(date +"%Y%m%d%H%M%S")
+	height=$(dash-cli getblockcount)
 	gobject=$(dash-cli gobject list)
 	echo "[$$] Parsing proposals for run_date = $run_date..." >&2
 	# I want to make all the DB changes in one go to make sure the database is consistent in case of power failure.
@@ -168,6 +168,7 @@ parseAndLoadProposals(){
 		url=$(jq -r '.url'<<<"$DataString")
 
 		#echo "$ProposalHash $CollateralHash $ObjectType $CreationTime $AbsoluteYesCount $YesCount $NoCount $AbstainCount $fBlockchainValidity $IsValidReason $fCachedValid $fCachedFunding $fCachedDelete $fCachedEndorsed $end_epoch $name $payment_address $payment_amount $start_epoch $Type $url"
+		if [[ "$CollateralHash" = "0000000000000000000000000000000000000000000000000000000000000000" ]];then continue;fi
 		result=$(execute_sql "select count(1) from proposals where ProposalHash=\"$ProposalHash\";")
 		if (( result==0 ));then
 			# The proposal is not found, so add it.
@@ -210,7 +211,7 @@ parseAndLoadProposals(){
 			} >> "$DATADIR"/logs/warnings.log
 		fi
 		# Insert the votes.
-		sql+="insert into votes(run_date,proposalhash,AbsoluteYesCount,YesCount,NoCount,AbstainCount)values($run_date,\"$ProposalHash\",$AbsoluteYesCount,$YesCount,$NoCount,$AbstainCount);"
+		sql+="insert into votes(run_date,height,proposalhash,AbsoluteYesCount,YesCount,NoCount,AbstainCount)values($run_date,$height,\"$ProposalHash\",$AbsoluteYesCount,$YesCount,$NoCount,$AbstainCount);"
 	done
 	sql+="commit;"
 	echo "[$$] Running SQL / Inserting data..." >&2
