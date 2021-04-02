@@ -1,7 +1,7 @@
 #!/bin/bash
 #set -x
 
-VERSION="$0 (v0.2.3 build date 202103221400)"
+VERSION="$0 (v0.3.0 build date 202103250000)"
 DATABASE_VERSION=1
 DATADIR="$HOME/.dash_proposal_loader"
 
@@ -106,9 +106,12 @@ initialise_database(){
 	sql+="insert into db_version values(1);"
 	sql+="create table proposals(run_date integer not null check(run_date>=0), ProposalHash text primary key not null, CollateralHash text not null, ObjectType integer not null, CreationTime integer not null, fBlockchainValidity text not null, IsValidReason text, fCachedValid text not null, fCachedFunding text not null, fCachedDelete text not null, fCachedEndorsed text not null, end_epoch integer not null, name text nor null, payment_address text not null, payment_amount real not null check(payment_amount>=0), start_epoch integer not null, Type integer not null, url text);"
 	sql+="create unique index idx_ProposalHash on proposals(ProposalHash);"
-	sql+="create table votes(run_date integer not null check(run_date>=0),height integer not null check(height>=0), ProposalHash text not null,  AbsoluteYesCount integer not null, YesCount integer not null, NoCount integer not null, AbstainCount integer not null,foreign key(ProposalHash)references proposals(ProposalHash), primary key(run_date,ProposalHash));"
+	sql+="create table votes(run_date integer not null check(run_date>=0),ProposalHash text not null,AbsoluteYesCount integer not null, YesCount integer not null, NoCount integer not null, AbstainCount integer not null,foreign key(ProposalHash)references proposals(ProposalHash), primary key(run_date,ProposalHash));"
 	sql+="create index idx_vote_ProposalHash on votes(ProposalHash);"
-	sql+="create trigger delete_proposal before delete on proposals for each row begin delete from votes where ProposalHash=old.ProposalHash;delete from votes where ProposalHash=old.ProposalHash;end;"
+	sql+="create table masternodes (run_date integer primary key not null check(run_date>=0), height integer not null check(height>=0), collateralised_masternode_count integer not null check(collateralised_masternode_count>=0),enabled_masternode_count integer not null check(enabled_masternode_count>=0));"
+	sql+="create index idx_masternode_rundate on masternodes(run_date);"
+	sql+="create trigger delete_proposal before delete on proposals for each row begin delete from votes where ProposalHash=old.ProposalHash;end;"
+	
 	execute_sql "$sql"
 	if (( $? != 0 ));then
 		echo "[$$] Cannot initialise sqlite database at $DATABASE_FILE exiting..." >&2
@@ -138,6 +141,10 @@ parseAndLoadProposals(){
 
 	run_date=$(date +"%Y%m%d%H%M%S")
 	height=$(dash-cli getblockcount)
+	masternode=$(dash-cli masternode count)
+	collateralised_masternode_count=$(jq -r '.total'<<<"$masternode")
+	enabled_masternode_count=$(jq -r '.enabled'<<<"$masternode")
+
 	gobject=$(dash-cli gobject list)
 	echo "[$$] Parsing proposals for run_date = $run_date..." >&2
 	# I want to make all the DB changes in one go to make sure the database is consistent in case of power failure.
@@ -211,8 +218,10 @@ parseAndLoadProposals(){
 			} >> "$DATADIR"/logs/warnings.log
 		fi
 		# Insert the votes.
-		sql+="insert into votes(run_date,height,proposalhash,AbsoluteYesCount,YesCount,NoCount,AbstainCount)values($run_date,$height,\"$ProposalHash\",$AbsoluteYesCount,$YesCount,$NoCount,$AbstainCount);"
+		sql+="insert into votes(run_date,proposalhash,AbsoluteYesCount,YesCount,NoCount,AbstainCount)values($run_date,\"$ProposalHash\",$AbsoluteYesCount,$YesCount,$NoCount,$AbstainCount);"
 	done
+	# Insert the masternode data.
+	sql+="insert into masternodes (run_date,height,collateralised_masternode_count,enabled_masternode_count)values($run_date,$height,$collateralised_masternode_count,$enabled_masternode_count);"
 	sql+="commit;"
 	echo "[$$] Running SQL / Inserting data..." >&2
 	start_time=$EPOCHSECONDS
