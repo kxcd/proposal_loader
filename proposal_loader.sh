@@ -1,7 +1,7 @@
 #!/bin/bash
 #set -x
 
-VERSION="$0 (v0.3.0 build date 202103250000)"
+VERSION="$0 (v0.4.0 build date 202104290000)"
 DATABASE_VERSION=1
 DATADIR="$HOME/.dash_proposal_loader"
 
@@ -229,8 +229,36 @@ parseAndLoadProposals(){
 	echo "[$$] SQL took $((EPOCHSECONDS-start_time)) seconds to run." >&2
 }
 
+# Returns 0: Means the snapshot was held, the vote tallies had changed.
+# Returns 1: Means the snapshot was purged, the vote tallies had not changed.
+removeSnapShotIfNoChanges(){
+	echo "[$$] Checking to see if the vote tallies have changed at all in this $run_date snapshot..." >&2
+	# $votes is the number of historical snapshots we have in the database, since we are comparing the most recent with the one just before, we need to make sure the database has at least two snapshots of voting data otherwise the below is going to fail.
+	((votes<1))&&return 1
+	sql="select sum(diff_votes)from(select v1.run_date, v1.proposalhash,abs(v1.absoluteyescount-v2.absoluteyescount)as diff_votes from votes v1 join votes v2 on v1.proposalhash=v2.proposalhash where v1.run_date=(select max(run_date) from votes) and v2.run_date=(select max(run_date) from votes where run_date!=v1.run_Date));"
+	sum_votes=$(execute_sql "$sql")
+	# If we sum the diffs between this snapshot and the previous one and get zero, then we know that the voting tallies have not changed and we may as well throw out that snapshot since it contains no new data.  ie the state is the same.
+	if ((sum_votes == 0));then
+		echo "[$$] No changes found in the vote tallies, deleting snapshot $run_date..." >&2
+		sql="begin transaction;delete from masternodes where run_date=$run_date;delete from votes where run_date=$run_date;commit;"
+		execute_sql "$sql"
+		return 1
+	fi
+}
 
+signalMnowatch(){
+	echo -n "[$$] Signaling MNOWatch...  Whale detected? " >&2
+	sql="select max(diff_votes)from(select v1.run_date, v1.proposalhash,abs(v1.absoluteyescount-v2.absoluteyescount)as diff_votes from votes v1 join votes v2 on v1.proposalhash=v2.proposalhash where v1.run_date=(select max(run_date) from votes) and v2.run_date=(select max(run_date) from votes where run_date!=v1.run_Date));"
+	biggest_change=$(execute_sql "$sql")
+	((biggest_change >= 10)) && { echo "Yes!" >&2 ;mkdir -p /tmp/leaderboard;echo "https://mnowatch.org/leaderboard/analysis/?$run_date" >/tmp/leaderboard/found_whale_actions_run_mnowatch;}||echo "No." >&2
+}
 
+# Do it in two steps to the making the unlinking of the old file and the replacement of the new one instant.
+copyToHtmlDir(){
+	echo "[$$] Copying the database to /var/www/html/..." >&2
+	cp -f "$DATABASE_FILE" /var/www/html/leaderboard/.proposals.db~
+	mv -f /var/www/html/leaderboard/.proposals.db~ /var/www/html/leaderboard/.proposals.db
+}
 
 #################################################
 #
@@ -244,4 +272,6 @@ make_datadir
 initialise_database
 check_and_upgrade_database
 parseAndLoadProposals
-
+removeSnapShotIfNoChanges || exit 0
+signalMnowatch
+copyToHtmlDir
