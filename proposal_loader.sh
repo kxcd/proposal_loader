@@ -237,8 +237,12 @@ removeSnapShotIfNoChanges(){
 	((votes<1))&&return 1
 	sql="select sum(diff_votes)from(select v1.run_date, v1.proposalhash,abs(v1.absoluteyescount-v2.absoluteyescount)as diff_votes from votes v1 join votes v2 on v1.proposalhash=v2.proposalhash where v1.run_date=(select max(run_date) from votes) and v2.run_date=(select max(run_date) from votes where run_date!=v1.run_Date));"
 	sum_votes=$(execute_sql "$sql")
-	# If we sum the diffs between this snapshot and the previous one and get zero, then we know that the voting tallies have not changed and we may as well throw out that snapshot since it contains no new data.  ie the state is the same.
-	if ((sum_votes == 0));then
+	# If the number of proposals is different between the snapshots, then keep the snapshot.  This deals with a new proposal arriving that doesn't get picked up because the join omits it.
+	sql="select abs((select count(proposalhash)from votes where run_date=(select max(run_date) from votes))-(select count(proposalhash)from votes where run_date=(select run_date from(select distinct run_date,dense_rank()over(order by run_date desc)date_rank from votes)where date_rank=2)));"
+	diff_proposals=$(execute "$sql")
+	changes=$((sum_votes + diff_proposals))
+	# If we sum the diffs between this snapshot and the previous one and get zero, then we know that the voting tallies have not changed and number of proposals have not changed and we may as well throw out that snapshot since it contains no new data.  ie the state is the same.
+	if ((changes == 0));then
 		echo "[$$] No changes found in the vote tallies, deleting snapshot $run_date..." >&2
 		sql="begin transaction;delete from masternodes where run_date=$run_date;delete from votes where run_date=$run_date;commit;"
 		execute_sql "$sql"
