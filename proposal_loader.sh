@@ -21,8 +21,7 @@ usage(){
 
 
 dcli () {
-	dash-cli -datadir=/tmp -rpcuser=rFZT1bSDuooCPVLHLlWpUWOumulY9G6bXE3A8Wiq -rpcpassword=XxFFNlU1NHeE1sp8IKdguGWpan2Xiv7mWImpaZQN "$@" || { echo "dash-cli error, exiting...";exit 1;}
-	#dash-cli -datadir=/tmp -rpcuser=rFZT1bSDuooCPVLHLlWpUWOumulY9G6bXE3A8Wiq -rpcpassword=XxFFNlU1NHeE1sp8IKdguGWpan2Xiv7mWImpaZQN -rpcconnect=95.183.50.58 "$@"
+	dash-cli -datadir=/tmp -rpcuser=rpcuser -rpcpassword=rpcpassword "$@" || { echo "dash-cli error, exiting...";exit 1;}
 }
 
 
