@@ -1,8 +1,8 @@
 #!/bin/bash
 #set -x
 
-VERSION="$0 (v0.4.0 build date 202104290000)"
-DATABASE_VERSION=1
+VERSION="$0 (v0.5.0 build date 202201030000)"
+DATABASE_VERSION=2
 DATADIR="$HOME/.dash_proposal_loader"
 
 
@@ -18,6 +18,13 @@ usage(){
 	msg+="	-datadir [path_to_dir]		The location to save the data in, default location is $DATADIR"
 	echo -e "$msg"
 }
+
+
+dcli () {
+	dash-cli -datadir=/tmp -rpcuser=rFZT1bSDuooCPVLHLlWpUWOumulY9G6bXE3A8Wiq -rpcpassword=XxFFNlU1NHeE1sp8IKdguGWpan2Xiv7mWImpaZQN "$@" || { echo "dash-cli error, exiting...";exit 1;}
+	#dash-cli -datadir=/tmp -rpcuser=rFZT1bSDuooCPVLHLlWpUWOumulY9G6bXE3A8Wiq -rpcpassword=XxFFNlU1NHeE1sp8IKdguGWpan2Xiv7mWImpaZQN -rpcconnect=95.183.50.58 "$@"
+}
+
 
 # Parse commandline options and set flags.
 while (( $# > 0 ))
@@ -52,6 +59,7 @@ DATABASE_FILE="$DATADIR/database/proposals.db"
 # Checks that the required software is installed on this machine.
 check_dependencies(){
 	unset progs
+	which dash-cli >/dev/null 2>&1 || { echo "dash-cli is not in PATH, please ensure a working dashd is present and in PATH.";exit 1;}
 	jq --help >/dev/null 2>&1 || progs+=" jq"
 	sqlite3 -version >/dev/null 2>&1 || progs+=" sqlite3"
 
@@ -103,10 +111,13 @@ initialise_database(){
 	# Create db objects.
 	sql="PRAGMA foreign_keys = ON;"
 	sql+="create table db_version(version integer primary key not null);"
-	sql+="insert into db_version values(1);"
+	sql+="insert into db_version values($DATABASE_VERSION);"
 	sql+="create table proposals(run_date integer not null check(run_date>=0), ProposalHash text primary key not null, CollateralHash text not null, ObjectType integer not null, CreationTime integer not null, fBlockchainValidity text not null, IsValidReason text, fCachedValid text not null, fCachedFunding text not null, fCachedDelete text not null, fCachedEndorsed text not null, end_epoch integer not null, name text nor null, payment_address text not null, payment_amount real not null check(payment_amount>=0), start_epoch integer not null, Type integer not null, url text);"
 	sql+="create unique index idx_ProposalHash on proposals(ProposalHash);"
 	sql+="create table votes(run_date integer not null check(run_date>=0),ProposalHash text not null,AbsoluteYesCount integer not null, YesCount integer not null, NoCount integer not null, AbstainCount integer not null,foreign key(ProposalHash)references proposals(ProposalHash), primary key(run_date,ProposalHash));"
+	sql+="create table proposal_owners(run_date integer not null,ProposalHash text primary key not null,ProposalOwner text,foreign key(ProposalHash)references proposals(ProposalHash));"
+	# If this table is new, pre-load it with
+	# insert into proposal_owners (proposalhash,run_date) select distinct proposalhash,(select max(run_date) from votes) from proposals;
 	sql+="create index idx_vote_ProposalHash on votes(ProposalHash);"
 	sql+="create table masternodes (run_date integer primary key not null check(run_date>=0), height integer not null check(height>=0), collateralised_masternode_count integer not null check(collateralised_masternode_count>=0),enabled_masternode_count integer not null check(enabled_masternode_count>=0));"
 	sql+="create index idx_masternode_rundate on masternodes(run_date);"
@@ -140,12 +151,12 @@ check_and_upgrade_database(){
 parseAndLoadProposals(){
 
 	run_date=$(date +"%Y%m%d%H%M%S")
-	height=$(dash-cli getblockcount)
-	masternode=$(dash-cli masternode count)
+	height=$(dcli getblockcount)
+	masternode=$(dcli masternode count)
 	collateralised_masternode_count=$(jq -r '.total'<<<"$masternode")
 	enabled_masternode_count=$(jq -r '.enabled'<<<"$masternode")
 
-	gobject=$(dash-cli gobject list)
+	gobject=$(dcli gobject list)
 	echo "[$$] Parsing proposals for run_date = $run_date..." >&2
 	# I want to make all the DB changes in one go to make sure the database is consistent in case of power failure.
 	sql="begin transaction;"
@@ -234,7 +245,7 @@ parseAndLoadProposals(){
 removeSnapShotIfNoChanges(){
 	echo "[$$] Checking to see if the vote tallies have changed at all in this $run_date snapshot..." >&2
 	# $votes is the number of historical snapshots we have in the database, since we are comparing the most recent with the one just before, we need to make sure the database has at least two snapshots of voting data otherwise the below is going to fail.
-	((votes<1))&&return 1
+	((votes<1))&&return 0
 	sql="select sum(diff_votes)from(select v1.run_date, v1.proposalhash,abs(v1.absoluteyescount-v2.absoluteyescount)as diff_votes from votes v1 join votes v2 on v1.proposalhash=v2.proposalhash where v1.run_date=(select max(run_date) from votes) and v2.run_date=(select max(run_date) from votes where run_date!=v1.run_Date));"
 	sum_votes=$(execute_sql "$sql")
 	# If the number of proposals is different between the snapshots, then keep the snapshot.  This deals with a new proposal arriving that doesn't get picked up because the join omits it.
@@ -250,11 +261,37 @@ removeSnapShotIfNoChanges(){
 	fi
 }
 
+loadProposalOwners(){
+	echo "[$$] Finding any new proposal owners and loading them into the database..." >&2
+	# We assume that this $run_date is in the database.
+	sql="select distinct proposalhash from votes where run_date=$run_date;"
+	proposalhashes=$(execute_sql "$sql")
+	for hash in $proposalhashes;do
+		#echo "$hash"
+		isFound=$(execute_sql "select \"yes\" from proposal_owners where proposalhash=\"$hash\";")
+		if [[ "$isFound" != "yes" ]];then
+			echo "[$$] No record in Proposal_Owners table for proposal_hash $hash, inserting now..." >&2
+			execute_sql "insert into proposal_owners values($run_date,\"$hash\",\"\");"
+		fi
+		proposalowner=$(execute_sql "select proposalowner from proposal_owners where proposalhash=\"$hash\";")
+		#echo "proposalowner = #${proposalowner}#"
+		if [[ "$proposalowner" == "" ]];then
+			echo "[$$] Found missing proposal owner that needs updating for proposal_hash $hash..." >&2
+			proposalowner=$(curl -s https://www.dashcentral.org/api/v1/proposal?hash=$hash|jq -r .proposal.owner_username)
+			retValCombined=$(($? + PIPSTATUS))
+			if ((retValCombined == 0));then
+				echo "[$$] Updating missing proposal owner in the database for proposal_hash $hash..." >&2
+				execute_sql "update proposal_owners set proposalowner=\"$proposalowner\" where proposalhash=\"$hash\";"
+			fi
+		fi
+	done
+}
+
 signalMnowatch(){
 	echo -n "[$$] Signaling MNOWatch...  Whale detected? " >&2
 	sql="select max(diff_votes)from(select v1.run_date, v1.proposalhash,abs(v1.absoluteyescount-v2.absoluteyescount)as diff_votes from votes v1 join votes v2 on v1.proposalhash=v2.proposalhash where v1.run_date=(select max(run_date) from votes) and v2.run_date=(select max(run_date) from votes where run_date!=v1.run_Date));"
 	biggest_change=$(execute_sql "$sql")
-	((biggest_change >= 10)) && { echo "Yes!" >&2 ;mkdir -p /tmp/leaderboard;echo "https://mnowatch.org/leaderboard/analysis/?$run_date" >/tmp/leaderboard/found_whale_actions_run_mnowatch;}||echo "No." >&2
+	((biggest_change >= 20)) && { echo "Yes!" >&2 ;mkdir -p /tmp/leaderboard;echo "https://mnowatch.org/leaderboard/analysis/?$run_date" >/tmp/leaderboard/found_whale_actions_run_mnowatch;}||echo "No." >&2
 }
 
 # Do it in two steps to the making the unlinking of the old file and the replacement of the new one instant.
@@ -277,5 +314,7 @@ initialise_database
 check_and_upgrade_database
 parseAndLoadProposals
 removeSnapShotIfNoChanges || exit 0
+loadProposalOwners
 signalMnowatch
 copyToHtmlDir
+
