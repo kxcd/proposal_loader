@@ -1,8 +1,8 @@
 #!/bin/bash
 #set -x
 
-VERSION="$0 (v0.5.0 build date 202201030000)"
-DATABASE_VERSION=2
+VERSION="$0 (v0.7.0 build date 202201140000)"
+DATABASE_VERSION=3
 DATADIR="$HOME/.dash_proposal_loader"
 
 
@@ -21,7 +21,7 @@ usage(){
 
 
 dcli () {
-	dash-cli -datadir=/tmp -rpcuser=rpcuser -rpcpassword=rpcpassword "$@" || { echo "dash-cli error, exiting...";exit 1;}
+	dash-cli -datadir=/tmp -conf=/etc/dash.conf "$@" || { echo "dash-cli error, exiting...";exit 1;}
 }
 
 
@@ -121,7 +121,10 @@ initialise_database(){
 	sql+="create table masternodes (run_date integer primary key not null check(run_date>=0), height integer not null check(height>=0), collateralised_masternode_count integer not null check(collateralised_masternode_count>=0),enabled_masternode_count integer not null check(enabled_masternode_count>=0));"
 	sql+="create index idx_masternode_rundate on masternodes(run_date);"
 	sql+="create trigger delete_proposal before delete on proposals for each row begin delete from votes where ProposalHash=old.ProposalHash;end;"
-	
+	# The superblock column stores the height at which the superblock happened, the dash_price will be the price of the coin at the time the block occured.
+	sql+="create table superblocks(run_date integer not null, superblock_date integer not null,superblock integer not null primary key, dash_price real not null);"
+	sql+="create table map_proposals_superblocks(ProposalHash text not null, superblock integer not null, primary key(ProposalHash,superblock), foreign key(ProposalHash)references proposals(ProposalHash), foreign key(superblock)references superblocks(superblock));"
+
 	execute_sql "$sql"
 	if (( $? != 0 ));then
 		echo "[$$] Cannot initialise sqlite database at $DATABASE_FILE exiting..." >&2
@@ -150,7 +153,7 @@ check_and_upgrade_database(){
 parseAndLoadProposals(){
 
 	run_date=$(date +"%Y%m%d%H%M%S")
-	height=$(dcli getblockcount)
+	height=$(dcli getblockcount)|| { echo "dash-cli failed, exiting...";exit 1;}
 	masternode=$(dcli masternode count)
 	collateralised_masternode_count=$(jq -r '.total'<<<"$masternode")
 	enabled_masternode_count=$(jq -r '.enabled'<<<"$masternode")
@@ -278,12 +281,132 @@ loadProposalOwners(){
 			echo "[$$] Found missing proposal owner that needs updating for proposal_hash $hash..." >&2
 			proposalowner=$(curl -s https://www.dashcentral.org/api/v1/proposal?hash=$hash|jq -r .proposal.owner_username)
 			retValCombined=$(($? + PIPSTATUS))
-			if ((retValCombined == 0));then
-				echo "[$$] Updating missing proposal owner in the database for proposal_hash $hash..." >&2
+			if ((retValCombined == 0)) && [[ $proposalowner != "null" ]] ;then
+				echo "[$$] Updating missing proposal owner '$proposalowner' in the database for proposal_hash $hash..." >&2
 				execute_sql "update proposal_owners set proposalowner=\"$proposalowner\" where proposalhash=\"$hash\";"
 			fi
 		fi
 	done
+}
+
+
+loadSuperBlockData(){
+	(($# != 1)) && return
+	superblock=$1
+	echo "[$$] Found a new Superblock at height $superblock, loading..." >&2
+
+	# Superblock table requires the superblock height, we have it, the date, we can get it and the price at that date.
+
+	block_hash=$(dcli getblockhash $superblock)
+	block=$(dcli getblock "$block_hash")
+	block_time_seconds=$(jq -r '.time'<<<"$block")
+	block_time=$(date +"%Y%m%d%H%M%S" -d @$block_time_seconds)
+	block_date=$(date +"%d-%m-%Y" -d @$block_time_seconds)
+	price=$(curl -s -X 'GET' "https://api.coingecko.com/api/v3/coins/dash/history?date=${block_date}&localization=en" -H 'accept: application/json'|jq '.market_data.current_price.usd')
+	[[ -z $price ]] && return 1
+	# Test for a valid number.
+	regex="^[-+]?[0-9]+\.?[0-9]*$"
+	[[ $price =~ $regex ]] || return 2
+	price=$(printf '%0.2f' $price)
+	echo "[$$] Determined price of Dash on $block_date was \$$price." >&2
+	sql="insert into superblocks (run_date, superblock_date, superblock, dash_price)values($run_date, $block_time, $superblock, \"$price\");"
+	execute_sql "$sql"
+
+	# The next step is to get a list of coinbase transactions and build an arrary of key=value pairs where the key is the payout address and the value is the Dash paid to it.
+
+	# Here I assume the first TX is the coinbase, but we still check for it in case it is not.
+	tx_hash=$(jq -r .tx[0] <<<"$block")
+	tx=$(dcli getrawtransaction $tx_hash 1)
+	coinbase=$(jq -r '.vin[].coinbase' <<< "$tx"|head -1)
+	[[ $coinbase == "null" ]] && { echo "[$$] Error! This transaction $tx_hash in block $superblock is not a coinbase!";return 3;}
+
+	# If we got this far, the TX is a coinbase and we can extract what we need.
+	declare -A address_array
+	num_addresses=$(jq -r '.vout|length'<<< "$tx")
+	for((i=0;i<num_addresses;i++));do
+		address=$(jq -r ".vout[$i].scriptPubKey.addresses"<<< "$tx"|sed -n 2p|sed 's/.*"\(.*\)"/\1/')
+		value=$(jq -r ".vout[$i].value"<<< "$tx")
+		if [[ -z ${address_array[$address]} ]];then
+			address_array[$address]=$value
+		else
+			echo "[$$] Duplicate payment found in tx hash $tx_hash ($address for $value Dash)." >&2
+			address_array[$address]+=" $value"
+		fi
+	done
+
+
+
+	# The next step is to determine the proposals active just before the voting closed and match those to payout transactions in the superblock.
+	# Voting will close this number of blocks before the superblock.
+	voting_deadline=$((superblock - 1662))
+	sql="select max(run_date) from masternodes where height=(select max(height) from masternodes where height<=$voting_deadline);"
+	best_run_date=$(execute_sql "$sql")
+	# Get the proposals with votes on that run_date.
+	sql="select p.proposalhash ,payment_address,payment_amount from votes v join proposals p on p.ProposalHash=v.ProposalHash where v.run_date=$best_run_date order by AbsoluteYesCount desc;"
+	while IFS="|" read proposalhash payment_address payment_amount junk;do
+		Value=${address_array[$payment_address]}
+		# Deal with the duplicates
+		num_dups=$(awk '{print NF}'<<<"$Value")
+		((num_dups == 0))&&echo "[$$] Proposal $proposalhash to address $payment_address for $payment_amount Dash was not paid."
+		for((k=1;k<num_dups+1;k++));do
+			value=$(awk -v k=$k '{print $k}'<<<"$Value")
+			#echo "[$$] payment_address = $payment_address value=$value payment_amount=$payment_amount"
+			# Standardise the amounts, for some reason, the database has cases with more than 8 decimals.
+			payment_amount=$(printf '%.8f' $payment_amount)
+			retval=$(bc<<<"$value == $payment_amount")
+			if ((retval == 1));then
+				# This bit prevents trying to insert the same proposal twice eg in the case the same address was paid the same amount two or more times in the block, eg
+				# https://chainz.cryptoid.info/dash/tx.dws?7a9b10f7ea616827ef69b52ada3c734e25c7de40fe3b3c18e2ee6739ae78e191.htm
+				retval=$(execute_sql "select 1 from map_proposals_superblocks where proposalhash=\"$proposalhash\" and superblock=$superblock;")
+				if [[ -z $retval ]];then
+					# We have found a match, so store this to the database.
+					echo "[$$] Matched payment for proposal $proposalhash paying to $payment_address for the amount of $payment_amount Dash. Loading database..." >&2
+					execute_sql "insert into map_proposals_superblocks values(\"$proposalhash\",$superblock);"
+				fi
+			fi
+		done
+	done < <(execute_sql "$sql")
+}
+
+
+# This function will insert rows into the following two tables:
+# superblocks
+# map_proposals_superblocks
+
+determineSuperBlock(){
+	# 1. Check for the heightest superblock number recorded in superblocks, if null set it as zero.
+	# 2. Check on heightest block number in masternodes and the lowest, if null, set to zero.
+	# 3. Return it max or min of masternodes block is zero.
+	# 4. Subtract height mn block from max of superblock and lowest block from masternodes.
+	# 5. Check for a superblock in this range.  If found determine its properties and continue with others.
+
+	echo "[$$] Determining if a superblock has passed that needs data to be loaded into the database..." >&2
+
+	max_height=$(execute_sql "select max(height) from masternodes;")
+	[[ -z $max_height ]] && return
+
+	min_height=$(execute_sql "select min(height) from masternodes;")
+
+	max_superblock=$(execute_sql "select max(superblock) from superblocks;")
+	[[ -z $max_superblock ]] && max_superblock=0
+
+	if ((max_superblock <= min_height));then
+		start_height=$min_height
+	else
+		start_height=$max_superblock
+	fi
+
+	# Now from start_height to max_height, determine if a superblock occured in that range.
+	# This variable is a superblock in the distant past.
+	SUPERBLOCK=980344
+	SUPERBLOCK_INTERVAL=16616
+
+	for((; SUPERBLOCK < max_height; SUPERBLOCK += SUPERBLOCK_INTERVAL));do
+		((SUPERBLOCK < start_height)) && continue
+		# If we get here, then this block must be a superblock in the range we are looking for, so populate the data.
+		loadSuperBlockData $SUPERBLOCK || break
+	done
+
 }
 
 signalMnowatch(){
@@ -311,9 +434,10 @@ check_dependencies
 make_datadir
 initialise_database
 check_and_upgrade_database
-parseAndLoadProposals
+parseAndLoadProposals || exit 1
 removeSnapShotIfNoChanges || exit 0
 loadProposalOwners
-signalMnowatch
-copyToHtmlDir
+determineSuperBlock
+#signalMnowatch
+#copyToHtmlDir
 
