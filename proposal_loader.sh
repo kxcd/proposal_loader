@@ -1,7 +1,7 @@
 #!/bin/bash
 #set -x
 
-VERSION="$0 (v0.7.0 build date 202201140000)"
+VERSION="$0 (v0.8.0 build date 202201150000)"
 DATABASE_VERSION=3
 DATADIR="$HOME/.dash_proposal_loader"
 
@@ -403,7 +403,11 @@ determineSuperBlock(){
 
 	for((; SUPERBLOCK < max_height; SUPERBLOCK += SUPERBLOCK_INTERVAL));do
 		((SUPERBLOCK < start_height)) && continue
-		# If we get here, then this block must be a superblock in the range we are looking for, so populate the data.
+		# If we get here, then this block must be a superblock in the range we are looking for.
+		# Check the database in case it is already there
+		retval=$(execute_sql "select 1 from superblocks where superblock=$SUPERBLOCK;")
+		((retval == 1)) && continue
+		# The superblock is new so populate the data.
 		loadSuperBlockData $SUPERBLOCK || break
 	done
 
@@ -438,6 +442,6 @@ parseAndLoadProposals || exit 1
 removeSnapShotIfNoChanges || exit 0
 loadProposalOwners
 determineSuperBlock
-#signalMnowatch
-#copyToHtmlDir
+signalMnowatch
+copyToHtmlDir
 
