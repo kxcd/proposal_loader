@@ -1,11 +1,11 @@
 #!/bin/bash
 #set -x
 
-VERSION="$0 (v0.8.0 build date 202201150000)"
+VERSION="$0 (v0.9.2 build date 202406211900)"
 DATABASE_VERSION=3
 DATADIR="$HOME/.dash_proposal_loader"
 
-
+pidof -q -x -o $$ $(basename "$0")&&exit
 
 
 usage(){
@@ -118,18 +118,23 @@ initialise_database(){
 	# If this table is new, pre-load it with
 	# insert into proposal_owners (proposalhash,run_date) select distinct proposalhash,(select max(run_date) from votes) from proposals;
 	sql+="create index idx_vote_ProposalHash on votes(ProposalHash);"
-	sql+="create table masternodes (run_date integer primary key not null check(run_date>=0), height integer not null check(height>=0), collateralised_masternode_count integer not null check(collateralised_masternode_count>=0),enabled_masternode_count integer not null check(enabled_masternode_count>=0));"
-	sql+="create index idx_masternode_rundate on masternodes(run_date);"
+	sqlite3 "$DATABASE_FILE" <<< "$sql" ||{ echo -e "[$$]\t Error creating database.";exit 1;}
+	cat > /tmp/proposal_loader_$$.sql <<"EOF"
+CREATE TABLE masternodes (
+	run_date integer primary key not null check(run_date>=0),
+	height integer not null check(height>=0),
+	enabled_masternodes_weight integer not null check(enabled_masternodes_weight>=0) -- Combined weight of 1k and 4k nodes
+);
+EOF
+	[[ -s /tmp/proposal_loader_$$.sql ]] || { echo -e "[$$]\t Unable to create SQL file at /tmp/proposal_loader_$$.sql.";exit 2;}
+	sqlite3 "$DATABASE_FILE" < /tmp/proposal_loader_$$.sql||{ echo -e "[$$]\t Error creating database.";exit 3;}
+	sql="create index idx_masternode_rundate on masternodes(run_date);"
 	sql+="create trigger delete_proposal before delete on proposals for each row begin delete from votes where ProposalHash=old.ProposalHash;end;"
 	# The superblock column stores the height at which the superblock happened, the dash_price will be the price of the coin at the time the block occured.
 	sql+="create table superblocks(run_date integer not null, superblock_date integer not null,superblock integer not null primary key, dash_price real not null);"
 	sql+="create table map_proposals_superblocks(ProposalHash text not null, superblock integer not null, primary key(ProposalHash,superblock), foreign key(ProposalHash)references proposals(ProposalHash), foreign key(superblock)references superblocks(superblock));"
 
-	execute_sql "$sql"
-	if (( $? != 0 ));then
-		echo "[$$] Cannot initialise sqlite database at $DATABASE_FILE exiting..." >&2
-		exit 4
-	fi
+	sqlite3 "$DATABASE_FILE" <<< "$sql" ||{ echo -e "[$$]\t Error creating database.";exit 4;}
 }
 
 
@@ -143,10 +148,26 @@ check_and_upgrade_database(){
 		echo "[$$] The database version is $db_version was expecting $DATABASE_VERSION" >&2
 		exit 5;
 	fi
+
+	echo "[$$] Checking integrity of the database..."
+    retval=$(execute_sql "PRAGMA main.integrity_check;" 2>>"$DATADIR"/logs/sqlite.log)
+    if [[ "$retval" != "ok" ]];then
+        echo -e "[$$] Database integrity check failed.\n$retval\nExiting..."
+        exit 6
+    fi
+    echo "[$$] Checking the foreign keys in the database..."
+    retval=$(execute_sql "PRAGMA main.foreign_key_check;" 2>>"$DATADIR"/logs/sqlite.log)
+    if (( ${#retval} != 0 ));then
+        echo "[$$] There are some errors with foreign keys in this database, exiting..."
+        exit 7
+    fi
+
 	proposals=$(execute_sql "select count(1) from proposals;")
 	votes=$(execute_sql "select count(distinct run_date) from votes;")
 	echo "[$$] Database is up to date and contains $proposals proposals and $votes snapshot(s)." >&2
 
+	# Database is consistent, delete from backups.
+	find "$DATADIR/database/" -mtime +1 -name "*xz" -delete
 }
 
 
@@ -155,15 +176,15 @@ parseAndLoadProposals(){
 	run_date=$(date +"%Y%m%d%H%M%S")
 	height=$(dcli getblockcount)|| { echo "dash-cli failed, exiting...";exit 1;}
 	masternode=$(dcli masternode count)
-	collateralised_masternode_count=$(jq -r '.total'<<<"$masternode")
-	enabled_masternode_count=$(jq -r '.enabled'<<<"$masternode")
+	enabled_masternodes_weight=$(($(jq '.detailed.regular.enabled'<<<"$masternode") + $(jq '.detailed.evo.enabled'<<<"$masternode")*4))
 
-	gobject=$(dcli gobject list)
+	# Filter out the triggers etc.
+	gobject=$(dcli gobject list valid proposals)
 	echo "[$$] Parsing proposals for run_date = $run_date..." >&2
 	# I want to make all the DB changes in one go to make sure the database is consistent in case of power failure.
 	sql="begin transaction;"
 
-	for hash in $(echo "$gobject"|grep -i -o '"[1234567890abcdef]*": {'|grep -i -o '[1234567890abcdef]*');do
+	for hash in $(jq -r 'keys_unsorted|.[]' <<< "$gobject");do
 		ProposalHash=$(jq -r ".\"$hash\".Hash"<<<"$gobject")
 		CollateralHash=$(jq -r ".\"$hash\".CollateralHash"<<<"$gobject")
 		ObjectType=$(jq -r ".\"$hash\".ObjectType"<<<"$gobject")
@@ -178,7 +199,9 @@ parseAndLoadProposals(){
 		fCachedFunding=$(jq -r ".\"$hash\".fCachedFunding"<<<"$gobject")
 		fCachedDelete=$(jq -r ".\"$hash\".fCachedDelete"<<<"$gobject")
 		fCachedEndorsed=$(jq -r ".\"$hash\".fCachedEndorsed"<<<"$gobject")
-		DataString=$(jq -r ".\"$hash\".DataString"<<<"$gobject"|sed 's/\\"/"/g;s/"{/{/g')
+		# Special care to decode the encoded json in the proposal.
+		DataString=$(jq ".[] | select(.Hash == \"$hash\").DataHex"<<<"$gobject")
+		DataString=$(eval dcli gobject deserialize $DataString)
 		end_epoch=$(jq -r '.end_epoch'<<<"$DataString")
 		name=$(jq -r '.name'<<<"$DataString")
 		payment_address=$(jq -r '.payment_address'<<<"$DataString")
@@ -234,7 +257,7 @@ parseAndLoadProposals(){
 		sql+="insert into votes(run_date,proposalhash,AbsoluteYesCount,YesCount,NoCount,AbstainCount)values($run_date,\"$ProposalHash\",$AbsoluteYesCount,$YesCount,$NoCount,$AbstainCount);"
 	done
 	# Insert the masternode data.
-	sql+="insert into masternodes (run_date,height,collateralised_masternode_count,enabled_masternode_count)values($run_date,$height,$collateralised_masternode_count,$enabled_masternode_count);"
+	sql+="insert into masternodes (run_date,height,enabled_masternodes_weight)values($run_date,$height,$enabled_masternodes_weight);"
 	sql+="commit;"
 	echo "[$$] Running SQL / Inserting data..." >&2
 	start_time=$EPOCHSECONDS
@@ -281,7 +304,7 @@ loadProposalOwners(){
 			echo "[$$] Found missing proposal owner that needs updating for proposal_hash $hash..." >&2
 			proposalowner=$(curl -s https://www.dashcentral.org/api/v1/proposal?hash=$hash|jq -r .proposal.owner_username)
 			retValCombined=$(($? + PIPSTATUS))
-			if ((retValCombined == 0)) && [[ $proposalowner != "null" ]] ;then
+			if ((retValCombined == 0)) && [[ -n $proposalowner ]] && [[ $proposalowner != "null" ]] ;then
 				echo "[$$] Updating missing proposal owner '$proposalowner' in the database for proposal_hash $hash..." >&2
 				execute_sql "update proposal_owners set proposalowner=\"$proposalowner\" where proposalhash=\"$hash\";"
 			fi
@@ -425,6 +448,10 @@ copyToHtmlDir(){
 	echo "[$$] Copying the database to /var/www/html/..." >&2
 	cp -f "$DATABASE_FILE" /var/www/html/leaderboard/.proposals.db~
 	mv -f /var/www/html/leaderboard/.proposals.db~ /var/www/html/leaderboard/.proposals.db
+	echo "[$$] Backing up the database..."
+	BACKUP_DB="$(dirname "$DATABASE_FILE")/${run_date}_proposals.db"
+	cp "$DATABASE_FILE" "$BACKUP_DB"
+	xz -9eT1 "$BACKUP_DB" >/dev/null 2>&1 &
 }
 
 #################################################
@@ -444,4 +471,5 @@ loadProposalOwners
 determineSuperBlock
 signalMnowatch
 copyToHtmlDir
+echo "[$$] Completed $VERSION in $SECONDS seconds, exiting..." >&2
 
